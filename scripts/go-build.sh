@@ -41,7 +41,7 @@ build() {
 
     # Create checksum with just the filename (no path)
     local filename=$(basename "${output_name}")
-    (cd "${OUTPUT_DIR}" && shasum -a 256 "${filename}" > "${filename}.sha256")
+    (cd "${OUTPUT_DIR}" && shasum -a 256 "${filename}" >> SHA256SUMS.tmp)
 }
 
 # Build for all platforms and architectures
@@ -54,27 +54,17 @@ done
 # Wait for all builds to complete
 wait
 
+# Sort and deduplicate the checksums file
+if [ -f "${OUTPUT_DIR}/SHA256SUMS.tmp" ]; then
+    sort -u "${OUTPUT_DIR}/SHA256SUMS.tmp" > "${OUTPUT_DIR}/SHA256SUMS"
+    rm -f "${OUTPUT_DIR}/SHA256SUMS.tmp"
+    echo "Created ${OUTPUT_DIR}/SHA256SUMS"
+fi
+
 echo "Build completed! Output files are in ${OUTPUT_DIR}/"
 
-# Create archives for distribution
-for os in "${PLATFORMS[@]}"; do
-    for arch in "${ARCHITECTURES[@]}"; do
-        bin_name="server_${os}_${arch}"
-        if [ "${os}" = "windows" ]; then
-            bin_name+=".exe"
-        fi
-        
-        echo "Creating archive for ${os}/${arch}..."
-        
-        pushd "${OUTPUT_DIR}" > /dev/null
-        if [ "${os}" = "windows" ]; then
-            zip -r "${bin_name%.exe}_${VERSION}_${os}_${arch}.zip" "${bin_name}" "${bin_name}.sha256"
-        else
-            tar -czf "${bin_name}_${VERSION}_${os}_${arch}.tar.gz" "${bin_name}" "${bin_name}.sha256"
-        fi
-        popd > /dev/null
-    done
-done
-
-echo "Archives created in ${OUTPUT_DIR}/"
+# List the built files
+echo -e "\nBuild output in ${OUTPUT_DIR}/:"
 ls -lh "${OUTPUT_DIR}/"
+echo -e "\nChecksums in ${OUTPUT_DIR}/SHA256SUMS:"
+cat "${OUTPUT_DIR}/SHA256SUMS"

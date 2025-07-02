@@ -39,8 +39,9 @@ build() {
         -o "${output_name}" \
         ./cmd/server
 
-    # Create checksum
-    shasum -a 256 "${output_name}" > "${output_name}.sha256"
+    # Create checksum with just the filename (no path)
+    local filename=$(basename "${output_name}")
+    (cd "${OUTPUT_DIR}" && shasum -a 256 "${filename}" > "${filename}.sha256")
 }
 
 # Build for all platforms and architectures

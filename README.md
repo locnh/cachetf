@@ -25,7 +25,7 @@ A high-performance proxy server for Terraform provider binaries with local cachi
 
 Run the Docker container:
 ```bash
-docker run -d -p 8080:8080 --name cache-t-f locnh/cache-t-f
+docker run -d -p 8080:8080 --name cachetf locnh/cachetf
 ```
 
 ### Docker compose (recommended)

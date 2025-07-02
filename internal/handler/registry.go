@@ -1,21 +1,26 @@
 package handler
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
-	"path/filepath"
-	regexp "regexp"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
+
+	"cachetf/internal/storage"
 )
 
 // RegistryHandler handles Terraform registry API requests
@@ -23,8 +28,13 @@ type RegistryHandler struct {
 	logger     *logrus.Logger
 	httpClient *http.Client
 	apiVersion string
-	cacheDir   string
+	storage    storage.Storage
 	mu         sync.RWMutex // Protects concurrent access to the cache
+}
+
+// Logger returns the logger instance for this handler
+func (h *RegistryHandler) Logger() *logrus.Logger {
+	return h.logger
 }
 
 // ProviderVersionsResponse represents the response from the Terraform registry versions endpoint
@@ -92,144 +102,93 @@ type IndexResponse struct {
 }
 
 // NewRegistryHandler creates a new RegistryHandler
-func NewRegistryHandler(logger *logrus.Logger, cacheDir string) *RegistryHandler {
-	// Create cache directory if it doesn't exist
-	if err := os.MkdirAll(cacheDir, 0755); err != nil {
-		logger.WithError(err).WithField("cache_dir", cacheDir).Fatal("Failed to create cache directory")
+func NewRegistryHandler(logger *logrus.Logger, storage storage.Storage) *RegistryHandler {
+	// Create HTTP client with timeout
+	httpClient := &http.Client{
+		Timeout: 30 * time.Second,
 	}
 
-	handler := &RegistryHandler{
-		logger:   logger,
-		cacheDir: cacheDir,
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-			Transport: &http.Transport{
-				DisableKeepAlives: true,
-			},
-		},
-		apiVersion: "v1",
+	return &RegistryHandler{
+		logger:     logger,
+		httpClient: httpClient,
+		apiVersion: "1.0.0",
+		storage:    storage,
 	}
-
-	// Log handler initialization
-	logger.WithFields(logrus.Fields{
-		"api_version": handler.apiVersion,
-		"cache_dir":   cacheDir,
-	}).Info("Initialized new RegistryHandler")
-
-	return handler
 }
 
-// getCachePath returns the full path to a cached file
-func (h *RegistryHandler) getCachePath(registry, namespace, provider, version, platform, arch string) string {
-	// Create a clean filename from the provider details
+// getCacheKey returns the storage key for a cached file in the format:
+// registry/namespace/provider/version/filename.zip
+// where filename is in the format: terraform-provider-{name}_{version}_{os}_{arch}.zip
+func (h *RegistryHandler) getCacheKey(registry, namespace, provider, version, platform, arch string) string {
+	// Construct the filename in the standard Terraform provider format
 	filename := fmt.Sprintf("terraform-provider-%s_%s_%s_%s.zip", provider, version, platform, arch)
-	// Return path in format: /cache/registry/namespace/provider/version/filename.zip
-	return filepath.Join(h.cacheDir, registry, namespace, provider, version, filename)
+
+	// Return the full path with the original filename
+	return fmt.Sprintf("%s/%s/%s/%s/%s",
+		registry, namespace, provider, version, filename)
 }
 
-// Helper function to verify SHA256 checksum of a file
-func verifyChecksum(filePath, expectedSum string) error {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to open file for checksum verification: %w", err)
-	}
-	defer f.Close()
+// Helper function to download a file and store it with checksum verification
+func (h *RegistryHandler) downloadFile(url, key, expectedSHA256 string) ([]byte, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, f); err != nil {
-		return fmt.Errorf("failed to calculate checksum: %w", err)
-	}
+	h.logger.WithFields(logrus.Fields{
+		"url": url,
+		"key": key,
+	}).Debug("Downloading file")
 
-	actualSum := hex.EncodeToString(hasher.Sum(nil))
-	if actualSum != expectedSum {
-		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedSum, actualSum)
-	}
-
-	return nil
-}
-
-// Helper function to download a file and save it to the cache with checksum verification
-func (h *RegistryHandler) downloadFile(url, destPath, expectedSHA256 string) error {
-	tempPath := destPath + ".tmp"
-	// Create the directory if it doesn't exist
-	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-		return fmt.Errorf("failed to create cache directory: %w", err)
-	}
-
-	// Remove temp file if it exists
-	_ = os.Remove(tempPath)
-
-	// Create the file
-	out, err := os.Create(tempPath)
-	if err != nil {
-		return fmt.Errorf("failed to create file: %w", err)
-	}
-
-	// Get the data
+	// Download the file
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		out.Close()
-		_ = os.Remove(tempPath)
-		return fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	h.logger.WithField("url", url).Debug("Downloading file")
+	// Set a timeout for the request
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	req = req.WithContext(ctx)
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		out.Close()
-		_ = os.Remove(tempPath)
-		return fmt.Errorf("failed to download file: %w", err)
+		return nil, fmt.Errorf("failed to download file: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Check server response
 	if resp.StatusCode != http.StatusOK {
-		out.Close()
-		_ = os.Remove(tempPath)
-		return fmt.Errorf("bad status: %s", resp.Status)
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	// Write the body to file
-	_, err = io.Copy(out, resp.Body)
+	// Create a buffer to store the downloaded data for checksum verification
+	var buf bytes.Buffer
+
+	// Create a tee reader to both save to buffer and calculate checksum
+	hasher := sha256.New()
+	multiWriter := io.MultiWriter(&buf, hasher)
+
+	// Download the file to memory for checksum verification
+	data, err := io.ReadAll(io.TeeReader(resp.Body, multiWriter))
 	if err != nil {
-		out.Close()
-		_ = os.Remove(tempPath)
-		return fmt.Errorf("failed to write file: %w", err)
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	// Close the file
-	if err := out.Close(); err != nil {
-		_ = os.Remove(tempPath)
-		return fmt.Errorf("failed to close file: %w", err)
-	}
-
-	// Verify checksum if provided
+	// Verify the checksum if provided
 	if expectedSHA256 != "" {
-		h.logger.WithFields(logrus.Fields{
-			"file":     tempPath,
-			"expected": expectedSHA256,
-		}).Debug("Verifying checksum")
-
-		if err := verifyChecksum(tempPath, expectedSHA256); err != nil {
-			_ = os.Remove(tempPath)
-			return fmt.Errorf("checksum verification failed: %w", err)
+		computedSum := hex.EncodeToString(hasher.Sum(nil))
+		if computedSum != expectedSHA256 {
+			return nil, fmt.Errorf("checksum verification failed: expected %s, got %s",
+				expectedSHA256, computedSum)
 		}
-		h.logger.WithField("file", tempPath).Debug("Checksum verified successfully")
 	}
 
-	// Rename the temp file to the final name
-	if err := os.Rename(tempPath, destPath); err != nil {
-		_ = os.Remove(tempPath)
-		return fmt.Errorf("failed to rename temp file: %w", err)
+	// Store the file in the storage backend
+	if err := h.storage.Put(context.Background(), key, bytes.NewReader(data)); err != nil {
+		return nil, fmt.Errorf("failed to store file: %w", err)
 	}
 
-	h.logger.WithFields(logrus.Fields{
-		"url":  url,
-		"path": destPath,
-	}).Info("Successfully downloaded and verified file")
-
-	return nil
+	h.logger.WithField("key", key).Debug("Successfully downloaded and verified file")
+	return data, nil
 }
 
 // Validation functions
@@ -284,20 +243,6 @@ func isValidVersion(version string) bool {
 	return matched
 }
 
-func isValidPlatform(platform string) bool {
-	// Common Terraform platforms
-	validPlatforms := map[string]bool{
-		"darwin":  true,
-		"freebsd": true,
-		"linux":   true,
-		"openbsd": true,
-		"solaris": true,
-		"windows": true,
-	}
-	_, valid := validPlatforms[platform]
-	return valid
-}
-
 func isValidArch(arch string) bool {
 	// Common Terraform architectures
 	validArches := map[string]bool{
@@ -311,17 +256,22 @@ func isValidArch(arch string) bool {
 	return valid
 }
 
+// isBrokenPipeError checks if the error is a broken pipe error
+func isBrokenPipeError(err error) bool {
+	if opErr, ok := err.(*net.OpError); ok {
+		if syscallErr, ok := opErr.Err.(*os.SyscallError); ok {
+			return syscallErr.Err.Error() == "broken pipe" ||
+				syscallErr.Err.Error() == "connection reset by peer"
+		}
+	}
+	return false
+}
+
 // GetProviderIndex returns the provider index
 func (h *RegistryHandler) GetProviderIndex(c *gin.Context) {
 	registry := c.Param("registry")
 	namespace := c.Param("namespace")
 	provider := c.Param("provider")
-
-	// Validate parameters
-	if !isValidRegistry(registry) || !isValidNamespace(namespace) || !isValidProvider(provider) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid parameters"})
-		return
-	}
 
 	h.logger.WithFields(logrus.Fields{
 		"registry":  registry,
@@ -329,16 +279,33 @@ func (h *RegistryHandler) GetProviderIndex(c *gin.Context) {
 		"provider":  provider,
 	}).Info("Provider index requested")
 
-	// Build the registry API URL
-	url := fmt.Sprintf("%s/%s/providers/%s/%s", registry, h.apiVersion, namespace, provider)
-	if !strings.HasPrefix(url, "http") {
-		url = "https://" + url
+	// Validate parameters
+	if !isValidRegistry(registry) || !isValidNamespace(namespace) || !isValidProvider(provider) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid parameters"})
+		return
 	}
+
+	// Build the registry API URL
+	baseURL := registry
+	if !strings.HasPrefix(baseURL, "http") {
+		baseURL = "https://" + baseURL
+	}
+	url := fmt.Sprintf("%s/v1/providers/%s/%s/versions", baseURL, namespace, provider)
 
 	h.logger.WithField("url", url).Debug("Fetching provider versions from registry")
 
 	// Make the request to the registry
-	resp, err := h.httpClient.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		h.logger.WithError(err).Error("Failed to create request")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+		return
+	}
+
+	// Add Terraform user agent
+	req.Header.Set("User-Agent", "Terraform/1.0.0")
+
+	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		h.logger.WithError(err).Error("Failed to fetch provider versions")
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to fetch provider versions"})
@@ -346,8 +313,9 @@ func (h *RegistryHandler) GetProviderIndex(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
+	body, _ := io.ReadAll(resp.Body)
+
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
 		h.logger.WithFields(logrus.Fields{
 			"status": resp.Status,
 			"body":   string(body),
@@ -359,28 +327,34 @@ func (h *RegistryHandler) GetProviderIndex(c *gin.Context) {
 		return
 	}
 
-	// Parse the response
-	var providerResp ProviderResponse
-	if err := json.NewDecoder(resp.Body).Decode(&providerResp); err != nil {
+	// Parse the response to get the list of versions
+	var versionsResp struct {
+		ID       string `json:"id"`
+		Versions []struct {
+			Version string `json:"version"`
+		} `json:"versions"`
+	}
+
+	if err := json.Unmarshal(body, &versionsResp); err != nil {
 		h.logger.WithError(err).Error("Failed to parse provider versions response")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to parse provider versions"})
 		return
 	}
 
-	h.logger.WithFields(logrus.Fields{
-		"provider_id": providerResp.ID,
-		"versions":    len(providerResp.Versions),
-	}).Debug("Fetched provider versions")
-
-	// Convert versions to the required format
-	versions := make(map[string]struct{})
-	for _, v := range providerResp.Versions {
-		versions[v] = struct{}{}
+	// Extract just the version strings
+	versions := make([]string, 0, len(versionsResp.Versions))
+	for _, v := range versionsResp.Versions {
+		versions = append(versions, v.Version)
 	}
 
-	// Return the response in the required format
-	c.JSON(http.StatusOK, &IndexResponse{
-		Versions: versions,
+	h.logger.WithFields(logrus.Fields{
+		"provider": provider,
+		"versions": len(versions),
+	}).Info("Returning provider versions")
+
+	// Return the versions in the expected format
+	c.JSON(http.StatusOK, gin.H{
+		"versions": versions,
 	})
 }
 
@@ -390,17 +364,16 @@ func (h *RegistryHandler) GetProviderVersion(c *gin.Context) {
 	namespace := c.Param("namespace")
 	provider := c.Param("provider")
 
-	// Get version from context
+	// Get version from context (set by the route handler)
 	versionVal, exists := c.Get("version")
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "version not found in context"})
 		return
 	}
 
-	// Convert version to string
 	version, ok := versionVal.(string)
-	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid version format"})
+	if !ok || version == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid version parameter"})
 		return
 	}
 
@@ -423,7 +396,7 @@ func (h *RegistryHandler) GetProviderVersion(c *gin.Context) {
 	if !strings.HasPrefix(baseURL, "http") {
 		baseURL = "https://" + baseURL
 	}
-	url := fmt.Sprintf("%s/%s/providers/%s/%s/versions", baseURL, h.apiVersion, namespace, provider)
+	url := fmt.Sprintf("%s/v1/providers/%s/%s/versions", baseURL, namespace, provider)
 
 	h.logger.WithField("url", url).Debug("Fetching provider versions from registry")
 
@@ -435,6 +408,9 @@ func (h *RegistryHandler) GetProviderVersion(c *gin.Context) {
 		return
 	}
 
+	// Add Terraform user agent
+	req.Header.Set("User-Agent", "Terraform/1.0.0")
+
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		h.logger.WithError(err).Error("Failed to fetch provider versions")
@@ -443,8 +419,9 @@ func (h *RegistryHandler) GetProviderVersion(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
+	body, _ := io.ReadAll(resp.Body)
+
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
 		h.logger.WithFields(logrus.Fields{
 			"status": resp.Status,
 			"body":   string(body),
@@ -457,58 +434,85 @@ func (h *RegistryHandler) GetProviderVersion(c *gin.Context) {
 	}
 
 	// Parse the response
-	var versionsResp ProviderVersionsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&versionsResp); err != nil {
+	var versionsResp struct {
+		ID       string `json:"id"`
+		Versions []struct {
+			Version   string   `json:"version"`
+			Protocols []string `json:"protocols"`
+			Platforms []struct {
+				OS   string `json:"os"`
+				Arch string `json:"arch"`
+			} `json:"platforms"`
+		} `json:"versions"`
+	}
+
+	if err := json.Unmarshal(body, &versionsResp); err != nil {
 		h.logger.WithError(err).Error("Failed to parse provider versions response")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to parse provider versions"})
 		return
 	}
 
-	// Find the requested version
-	var foundVersion *struct {
-		Version   string   `json:"version"`
-		Protocols []string `json:"protocols"`
-		Platforms []struct {
-			OS   string `json:"os"`
-			Arch string `json:"arch"`
-		} `json:"platforms"`
-	}
-
+	// Build the response with all available versions
+	versions := make([]string, 0, len(versionsResp.Versions))
 	for _, v := range versionsResp.Versions {
-		if v.Version == version {
-			foundVersion = &v
-			break
-		}
+		versions = append(versions, v.Version)
 	}
 
-	if foundVersion == nil {
-		h.logger.WithField("version", version).Warn("Version not found")
-		c.JSON(http.StatusNotFound, gin.H{"error": "version not found"})
+	// If a specific version was requested, return its details
+	if version != "" && version != "index.json" {
+		var foundVersion *struct {
+			Version   string   `json:"version"`
+			Protocols []string `json:"protocols"`
+			Platforms []struct {
+				OS   string `json:"os"`
+				Arch string `json:"arch"`
+			} `json:"platforms"`
+		}
+
+		for i, v := range versionsResp.Versions {
+			if v.Version == version {
+				// Create a copy of the version to avoid referencing loop variable
+				ver := versionsResp.Versions[i]
+				foundVersion = &ver
+				break
+			}
+		}
+
+		if foundVersion == nil {
+			h.logger.WithField("version", version).Warn("Version not found")
+			c.JSON(http.StatusNotFound, gin.H{"error": "version not found"})
+			return
+		}
+
+		// Build the response for specific version
+		response := VersionResponse{
+			Archives: make(map[string]ArchiveInfo),
+		}
+
+		// Add each platform/arch combination to the response
+		for _, platform := range foundVersion.Platforms {
+			key := fmt.Sprintf("%s_%s", platform.OS, platform.Arch)
+			filename := fmt.Sprintf("terraform-provider-%s_%s_%s_%s.zip",
+				provider, version, platform.OS, platform.Arch)
+
+			response.Archives[key] = ArchiveInfo{
+				URL: filename,
+			}
+		}
+
+		h.logger.WithFields(logrus.Fields{
+			"version":  version,
+			"archives": len(response.Archives),
+		}).Info("Returning version details")
+
+		c.JSON(http.StatusOK, response)
 		return
 	}
 
-	// Build the response
-	response := VersionResponse{
-		Archives: make(map[string]ArchiveInfo),
-	}
-
-	// Add each platform/arch combination to the response
-	for _, platform := range foundVersion.Platforms {
-		key := fmt.Sprintf("%s_%s", platform.OS, platform.Arch)
-		filename := fmt.Sprintf("terraform-provider-%s_%s_%s_%s.zip",
-			provider, version, platform.OS, platform.Arch)
-
-		response.Archives[key] = ArchiveInfo{
-			URL: filename,
-		}
-	}
-
-	h.logger.WithFields(logrus.Fields{
-		"version":  version,
-		"archives": len(response.Archives),
-	}).Info("Returning version details")
-
-	c.JSON(http.StatusOK, response)
+	// Return the list of versions if no specific version was requested
+	c.JSON(http.StatusOK, gin.H{
+		"versions": versions,
+	})
 }
 
 // DownloadProvider downloads the provider binary
@@ -516,197 +520,217 @@ func (h *RegistryHandler) DownloadProvider(c *gin.Context) {
 	registry := c.Param("registry")
 	namespace := c.Param("namespace")
 	provider := c.Param("provider")
-	file := c.Param("file") // Full filename including .zip
 
-	// Parse the filename to extract provider, version, os, and architecture
-	re := regexp.MustCompile(`^terraform-provider-([a-z0-9-]+)_(\d+\.\d+\.\d+)_([a-z]+)_([a-z0-9]+)\.zip$`)
-	matches := re.FindStringSubmatch(file)
-	if len(matches) != 5 { // full match + 4 groups
-		h.logger.WithField("file", file).Error("Invalid file format")
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file format"})
+	// Get version, os, and arch from context (set by the route handler)
+	versionVal, exists := c.Get("version")
+	if !exists {
+		h.logger.Error("Version not found in context")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "version not found in context"})
 		return
 	}
 
-	// Extract components from filename
-	// matches[1] is the provider name (should match the one in the URL)
-	// matches[2] is the version
-	// matches[3] is the OS
-	// matches[4] is the architecture
-	version := matches[2]
-	osName := matches[3]
-	arch := matches[4]
-
-	// Verify provider name in URL matches the one in the filename
-	if matches[1] != provider {
-		h.logger.WithFields(logrus.Fields{
-			"url_provider":      provider,
-			"filename_provider": matches[1],
-		}).Error("Provider name in URL does not match filename")
-		c.JSON(http.StatusBadRequest, gin.H{"error": "provider name mismatch"})
+	osVal, exists := c.Get("os")
+	if !exists {
+		h.logger.Error("OS not found in context")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "os not found in context"})
 		return
 	}
 
-	// Validate parameters
-	if !isValidRegistry(registry) || !isValidNamespace(namespace) ||
-		!isValidProvider(provider) || !isValidVersion(version) ||
-		!isValidOS(osName) || !isValidArch(arch) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid parameters"})
+	archVal, exists := c.Get("arch")
+	if !exists {
+		h.logger.Error("Architecture not found in context")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "architecture not found in context"})
 		return
 	}
 
-	logFields := logrus.Fields{
+	version := versionVal.(string)
+	osName := osVal.(string)
+	arch := archVal.(string)
+
+	h.logger.WithFields(logrus.Fields{
 		"registry":  registry,
 		"namespace": namespace,
 		"provider":  provider,
 		"version":   version,
 		"os":        osName,
 		"arch":      arch,
-	}
-	h.logger.WithFields(logFields).Info("Provider download requested")
+	}).Debug("Processing download request")
 
-	// Ensure the cache directory exists
-	cacheDir := filepath.Dir(h.getCachePath(registry, namespace, provider, version, osName, arch))
-	if err := os.MkdirAll(cacheDir, 0755); err != nil {
-		h.logger.WithError(err).Error("Failed to create cache directory")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+	// Validate inputs
+	if !isValidRegistry(registry) || !isValidNamespace(namespace) || !isValidProvider(provider) ||
+		!isValidVersion(version) || !isValidOS(osName) || !isValidArch(arch) {
+		h.logger.WithFields(logrus.Fields{
+			"registry":  registry,
+			"namespace": namespace,
+			"provider":  provider,
+			"version":   version,
+			"os":        osName,
+			"arch":      arch,
+		}).Error("Invalid parameters")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid parameters"})
 		return
 	}
 
-	// Check if the file is already in the cache
-	cachePath := h.getCachePath(registry, namespace, provider, version, osName, arch)
+	// Construct the filename
+	filename := fmt.Sprintf("terraform-provider-%s_%s_%s_%s.zip", provider, version, osName, arch)
 
-	// Check if the file exists and is not empty
-	if info, err := os.Stat(cachePath); err == nil && info.Size() > 0 {
-		h.logger.WithFields(logFields).WithField("cache_path", cachePath).
-			Debug("Serving provider binary from cache")
-	} else {
-		// Download the file
-		h.mu.Lock()
-		defer h.mu.Unlock()
+	// Check if the file exists in the cache
+	cacheKey := h.getCacheKey(registry, namespace, provider, version, osName, arch)
 
-		// Check again in case another goroutine downloaded it while we were waiting for the lock
-		if _, err := os.Stat(cachePath); err != nil && os.IsNotExist(err) {
-			// Build the download info URL
-			downloadInfoURL := fmt.Sprintf("%s/%s/providers/%s/%s/%s/download/%s/%s",
-				strings.TrimSuffix(registry, "/"),
-				strings.Trim(h.apiVersion, "/"),
-				namespace,
-				provider,
-				version,
-				osName,
-				arch)
+	// Check if the file exists in the cache
+	exists, err := h.storage.Exists(c.Request.Context(), cacheKey)
+	if err != nil {
+		h.logger.WithError(err).WithField("key", cacheKey).Error("Failed to check if file exists in cache")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check cache"})
+		return
+	}
 
-			// Ensure the URL has the correct scheme
-			if !strings.HasPrefix(downloadInfoURL, "http") {
-				downloadInfoURL = "https://" + downloadInfoURL
-			}
-
-			h.logger.WithFields(logFields).
-				WithField("download_info_url", downloadInfoURL).
-				Info("Fetching download information")
-
-			// Get the download information
-			req, err := http.NewRequest("GET", downloadInfoURL, nil)
-			if err != nil {
-				h.logger.WithError(err).Error("Failed to create download info request")
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
-				return
-			}
-
-			resp, err := h.httpClient.Do(req)
-			if err != nil {
-				h.logger.WithError(err).Error("Failed to fetch download info")
-				c.JSON(http.StatusBadGateway, gin.H{"error": "failed to fetch download information"})
-				return
-			}
-			defer resp.Body.Close()
-
-			// Read the response body
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				h.logger.WithError(err).Error("Failed to read response body")
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read response"})
-				return
-			}
-
-			if resp.StatusCode != http.StatusOK {
-				h.logger.WithFields(logrus.Fields{
-					"status": resp.Status,
-					"body":   string(body),
-				}).Error("Unexpected response from registry for download info")
-				c.JSON(http.StatusBadGateway, gin.H{
-					"error":  "failed to fetch download information",
-					"status": resp.Status,
-				})
-				return
-			}
-
-			// Parse the download information
-			var downloadInfo struct {
-				DownloadURL string   `json:"download_url"`
-				SHASum      string   `json:"shasum"`
-				Protocols   []string `json:"protocols"`
-			}
-
-			if err := json.Unmarshal(body, &downloadInfo); err != nil {
-				h.logger.WithError(err).Error("Failed to parse download info response")
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to parse download information"})
-				return
-			}
-
-			if downloadInfo.DownloadURL == "" || downloadInfo.SHASum == "" {
-				h.logger.Error("Missing download URL or SHA256 checksum in response")
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid download information"})
-				return
-			}
-
-			h.logger.WithFields(logrus.Fields{
-				"download_url": downloadInfo.DownloadURL,
-				"sha256":       downloadInfo.SHASum,
-			}).Info("Downloading provider binary")
-
-			// Download the file to a temporary location first
-			tmpPath := cachePath + ".tmp"
-			if err := h.downloadFile(downloadInfo.DownloadURL, tmpPath, downloadInfo.SHASum); err != nil {
-				// Clean up the temporary file if it exists
-				if _, statErr := os.Stat(tmpPath); statErr == nil {
-					os.Remove(tmpPath)
-				}
-				h.logger.WithError(err).Error("Failed to download or verify provider binary")
-				c.JSON(http.StatusInternalServerError, gin.H{
-					"error":   "failed to download or verify provider binary",
-					"details": err.Error(),
-				})
-				return
-			}
-
-			// Rename the temporary file to the final location atomically
-			if err := os.Rename(tmpPath, cachePath); err != nil {
-				h.logger.WithError(err).Error("Failed to move downloaded file to cache")
-				c.JSON(http.StatusInternalServerError, gin.H{
-					"error":   "failed to cache downloaded file",
-					"details": err.Error(),
-				})
-				return
-			}
-
-			h.logger.WithFields(logrus.Fields{
-				"cache_path": cachePath,
-				"sha256":     downloadInfo.SHASum,
-			}).Info("Successfully downloaded and verified provider binary")
-		} else if err != nil {
-			h.logger.WithError(err).Error("Error checking cache file")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "error checking cache"})
+	if exists {
+		h.logger.WithField("key", cacheKey).Info("Serving from cache")
+		// File exists in cache, serve it
+		fileReader, err := h.storage.Get(c.Request.Context(), cacheKey)
+		if err != nil {
+			h.logger.WithError(err).Error("Failed to get file from cache")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get file from cache"})
 			return
+		}
+		defer fileReader.Close()
+
+		// Set the appropriate headers
+		c.Header("Content-Type", "application/zip")
+		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
+
+		// Stream the file to the client
+		_, err = io.Copy(c.Writer, fileReader)
+		if err != nil && !isBrokenPipeError(err) {
+			h.logger.WithError(err).Error("Failed to stream file from cache")
+		}
+		return
+	}
+
+	// If file doesn't exist in storage, download it
+	if !exists {
+		h.logger.WithField("key", cacheKey).Info("File not found in storage, downloading...")
+
+		// Get the download URL from the upstream registry
+		downloadURL := fmt.Sprintf("https://%s/v1/providers/%s/%s/%s/download/%s/%s",
+			registry,
+			namespace,
+			provider,
+			version,
+			osName,
+			arch,
+		)
+
+		h.logger.WithField("url", downloadURL).Debug("Fetching download info from upstream")
+
+		req, err := http.NewRequest("GET", downloadURL, nil)
+		if err != nil {
+			h.logger.WithError(err).Error("Failed to create request")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+			return
+		}
+
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := h.httpClient.Do(req)
+		if err != nil {
+			h.logger.WithError(err).Error("Failed to fetch download info")
+			c.JSON(http.StatusBadGateway, gin.H{"error": "failed to fetch download info"})
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			h.logger.WithFields(logrus.Fields{
+				"status": resp.StatusCode,
+				"url":    downloadURL,
+			}).Error("Unexpected status code from registry")
+			c.JSON(resp.StatusCode, gin.H{"error": "failed to fetch download info"})
+			return
+		}
+
+		var downloadInfo DownloadResponse
+		if err := json.NewDecoder(resp.Body).Decode(&downloadInfo); err != nil {
+			h.logger.WithError(err).Error("Failed to parse download info")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to parse download info"})
+			return
+		}
+
+		// Validate download info
+		if downloadInfo.DownloadURL == "" || downloadInfo.SHASum == "" {
+			h.logger.Error("Missing download URL or SHA256 checksum in response")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid download information"})
+			return
+		}
+
+		h.logger.WithFields(logrus.Fields{
+			"download_url": downloadInfo.DownloadURL,
+			"sha256":       downloadInfo.SHASum,
+		}).Info("Downloading provider binary")
+
+		// Download and store the file
+		_, err = h.downloadFile(downloadInfo.DownloadURL, cacheKey, downloadInfo.SHASum)
+		if err != nil {
+			h.logger.WithError(err).Error("Failed to download or verify provider binary")
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":   "failed to download or verify provider binary",
+				"details": err.Error(),
+			})
+			return
+		}
+
+		h.logger.WithFields(logrus.Fields{
+			"key":    cacheKey,
+			"sha256": downloadInfo.SHASum,
+		}).Info("Successfully downloaded and verified provider binary")
+	}
+
+	// Get the file from storage
+	reader, err := h.storage.Get(c.Request.Context(), cacheKey)
+	if err != nil {
+		h.logger.WithError(err).Error("Error getting file from storage")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "error retrieving file from storage"})
+		return
+	}
+	defer reader.Close()
+
+	// Get file info for content length if available
+	var contentLength int64 = -1
+	if fi, ok := reader.(interface{ Stat() (os.FileInfo, error) }); ok {
+		if stat, err := fi.Stat(); err == nil {
+			contentLength = stat.Size()
 		}
 	}
 
 	// Set headers for file download
 	c.Header("Content-Description", "File Transfer")
 	c.Header("Content-Transfer-Encoding", "binary")
-	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filepath.Base(file)))
-	c.Header("Content-Type", "application/octet-stream")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
+	c.Header("Content-Type", "application/zip")
 
-	// Serve the file
-	c.File(cachePath)
+	if contentLength >= 0 {
+		c.Header("Content-Length", strconv.FormatInt(contentLength, 10))
+	}
+
+	// Use a buffer to stream the file in chunks
+	buf := make([]byte, 32*1024) // 32KB chunks
+	for {
+		n, err := reader.Read(buf)
+		if n > 0 {
+			if _, err := c.Writer.Write(buf[:n]); err != nil {
+				if !isBrokenPipeError(err) {
+					h.logger.WithError(err).Error("Error writing file chunk to response")
+				}
+				return
+			}
+			c.Writer.Flush()
+		}
+		if err != nil {
+			if err != io.EOF {
+				h.logger.WithError(err).Error("Error reading file from storage")
+			}
+			break
+		}
+	}
 }

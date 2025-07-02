@@ -1,25 +1,27 @@
 package routes
 
 import (
+	"fmt"
 	"net/http"
 	"regexp"
 	"strings"
 
+	"cachetf/internal/handler"
+	"cachetf/internal/storage"
+
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
-	"cache-t-f/internal/handler"
 )
 
 // SetupRoutes configures all the routes for the application
 func SetupRoutes(router *gin.Engine, config *Config) {
-	// Ensure cache directory exists and is writable
-	if config.CacheDir == "" {
-		// This should not happen as we set a default in config
-		logrus.Fatal("Cache directory is not configured")
+	// Ensure storage is configured
+	if config.Storage == nil {
+		logrus.Fatal("Storage is not configured")
 	}
 
-	// Create handler with logger and cache directory
-	registryHandler := handler.NewRegistryHandler(logrus.StandardLogger(), config.CacheDir)
+	// Create handler with logger and storage
+	registryHandler := handler.NewRegistryHandler(logrus.StandardLogger(), config.Storage)
 
 	// Health check endpoint
 	router.GET("/health", func(c *gin.Context) {
@@ -37,47 +39,68 @@ func SetupRoutes(router *gin.Engine, config *Config) {
 		// GET /:registry/:namespace/:provider/index.json
 		registry.GET("/index.json", registryHandler.GetProviderIndex)
 
-		// Handle both .zip and .json files with a single route
-		registry.GET("/:file", func(c *gin.Context) {
-			file := c.Param("file")
+		// Handle both version and file requests
+		re := regexp.MustCompile(`^(\d+\.\d+\.\d+)(?:-[\w-]+)?(?:\.json)?$`)
+		registry.GET("/:fileOrVersion", func(c *gin.Context) {
+			fileOrVersion := c.Param("fileOrVersion")
 
-			// Check if it's a .json file (version info)
-			if strings.HasSuffix(file, ".json") {
-				// Extract version from filename (remove .json)
-				version := strings.TrimSuffix(file, ".json")
+			// Check if it's a version request (e.g., 1.2.3 or 1.2.3.json)
+			version := strings.TrimSuffix(fileOrVersion, ".json")
+			if re.MatchString(version) {
 				c.Set("version", version)
 				registryHandler.GetProviderVersion(c)
 				return
 			}
 
 			// Check if it's a .zip file (provider binary)
-			if strings.HasSuffix(file, ".zip") {
-				re := regexp.MustCompile(`^terraform-provider-([a-z0-9-]+)_(\d+\.\d+\.\d+)_([a-z]+)_([a-z0-9]+)\.zip$`)
-				matches := re.FindStringSubmatch(file)
-				
-				if len(matches) != 5 { // full match + 4 groups
-					c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file format"})
+			if strings.HasSuffix(fileOrVersion, ".zip") {
+				// Debug log the incoming filename
+				logrus.WithField("filename", fileOrVersion).Debug("Processing provider binary request")
+
+				// More permissive pattern to match the provider binary filename
+				pattern := `^terraform-provider-([^_]+?)_(\d+\.\d+\.\d+(?:-[\w-]+)?)_([^_]+)_([^.]+)\.zip$`
+				re := regexp.MustCompile(pattern)
+				matches := re.FindStringSubmatch(fileOrVersion)
+
+				logrus.WithFields(logrus.Fields{
+					"filename": fileOrVersion,
+					"pattern":  pattern,
+					"matches":  matches,
+				}).Debug("Regex match results")
+
+				if len(matches) < 5 { // full match + 4 groups
+					errMsg := fmt.Sprintf("invalid file format: %s (pattern: %s, matches: %v)", fileOrVersion, pattern, matches)
+					logrus.WithField("filename", fileOrVersion).Error("Failed to match provider binary pattern")
+					c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
 					return
 				}
 
-				// Log the request
-				logrus.WithFields(logrus.Fields{
-					"provider": matches[1],
-					"version":  matches[2],
-					"os":       matches[3],
-					"arch":     matches[4],
-				}).Info("Provider download requested")
+				// Set the file parameter in the URL parameters
+				c.Params = append(c.Params, gin.Param{
+					Key:   "file",
+					Value: fileOrVersion,
+				})
 
-				// Set the version in context for the handler
+				// Also set the individual components as context values
 				c.Set("version", matches[2])
+				c.Set("os", matches[3])
+				c.Set("arch", matches[4])
+
+				// Log the file download request
+				registryHandler.Logger().WithFields(logrus.Fields{
+					"file":    fileOrVersion,
+					"version": matches[2],
+					"os":      matches[3],
+					"arch":    matches[4],
+				}).Debug("Calling DownloadProvider")
+
+				// Call the download handler
 				registryHandler.DownloadProvider(c)
 				return
 			}
 
-			// If not .json or .zip, return 404
-			c.JSON(http.StatusNotFound, gin.H{
-				"error": "Not Found",
-			})
+			// If we get here, it's an unsupported request
+			c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported request"})
 		})
 	}
 
@@ -92,5 +115,5 @@ func SetupRoutes(router *gin.Engine, config *Config) {
 // Config holds the configuration for routes
 type Config struct {
 	URIPrefix string
-	CacheDir  string
+	Storage   storage.Storage
 }

@@ -1,8 +1,8 @@
 ---
 services:
-  cache-t-f:
-    image: locnh/cache-t-f:latest
-    container_name: cache-t-f
+  cachetf:
+    image: locnh/cachetf:latest
+    container_name: cachetf
     restart: unless-stopped
     ports:
       - "8080:8080"

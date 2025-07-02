@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"cachetf/internal/storage"
+
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 )
@@ -13,7 +14,7 @@ import (
 // CacheHandler handles cache-related operations
 type CacheHandler struct {
 	storage storage.Storage
-	logger *logrus.Logger
+	logger  *logrus.Logger
 }
 
 // NewCacheHandler creates a new CacheHandler
@@ -81,5 +82,4 @@ func (h *CacheHandler) RegisterCacheRoutes(router *gin.RouterGroup) {
 	router.DELETE("/:registry/:namespace", h.DeleteCache)
 	router.DELETE("/:registry/:namespace/:provider", h.DeleteCache)
 	router.DELETE("/:registry/:namespace/:provider/:version", h.DeleteCache)
-	router.DELETE("/:registry/:namespace/:provider/:version/:file", h.DeleteCache)
 }

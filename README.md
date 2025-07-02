@@ -57,7 +57,7 @@ docker compose up -d
    # Base path for API endpoints default: /providers
    URI_PREFIX=/providers
    
-   # Storage type (local or s3)
+   # Storage type (local or s3, default: local)
    STORAGE_TYPE=local
 
    # S3 Configuration (required if STORAGE_TYPE=s3)

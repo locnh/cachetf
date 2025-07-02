@@ -147,15 +147,25 @@ func (s *LocalStorage) DeleteByPrefix(ctx context.Context, prefix string) (int, 
 	searchPath := filepath.Join(s.baseDir, prefix)
 	
 	// Check if the path exists first
-	_, err := os.Stat(searchPath)
+	fileInfo, err := os.Stat(searchPath)
 	if os.IsNotExist(err) {
+		s.logger.WithField("path", searchPath).Debug("Path does not exist, nothing to delete")
 		return 0, nil // No files to delete
 	}
 	if err != nil {
 		return 0, fmt.Errorf("error checking path %s: %w", searchPath, err)
 	}
 
-	// Walk the directory and delete matching files
+	// If it's a file, just delete it and return count 1
+	if !fileInfo.IsDir() {
+		if err := os.Remove(searchPath); err != nil {
+			return 0, fmt.Errorf("error deleting file %s: %w", searchPath, err)
+		}
+		s.logger.WithField("path", searchPath).Debug("Deleted file")
+		return 1, nil
+	}
+
+	// For directories, walk and count all files
 	var deletedCount int
 	err = filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -167,25 +177,28 @@ func (s *LocalStorage) DeleteByPrefix(ctx context.Context, prefix string) (int, 
 			return nil
 		}
 
-		// Delete the file or directory
-		if err := os.RemoveAll(path); err != nil {
-			s.logger.WithError(err).WithField("path", path).Error("Failed to delete path")
-			return err
+		// Only count files, not directories
+		if !info.IsDir() {
+			deletedCount++
+			s.logger.WithField("path", path).Debug("Marked file for deletion")
 		}
 
-		// If it's a directory, we'll count each file in it
-		if info.IsDir() {
-			return filepath.SkipDir
-		}
-
-		deletedCount++
-		s.logger.WithField("path", path).Debug("Deleted file")
 		return nil
 	})
 
 	if err != nil {
-		return deletedCount, fmt.Errorf("error walking path %s: %w", searchPath, err)
+		return 0, fmt.Errorf("error walking directory %s: %w", searchPath, err)
 	}
+
+	// Now actually delete the directory and all its contents
+	if err := os.RemoveAll(searchPath); err != nil {
+		return 0, fmt.Errorf("error deleting directory %s: %w", searchPath, err)
+	}
+
+	s.logger.WithFields(logrus.Fields{
+		"path":  searchPath,
+		"count": deletedCount,
+	}).Info("Deleted directory and its contents")
 
 	s.logger.WithFields(logrus.Fields{
 		"prefix": prefix,

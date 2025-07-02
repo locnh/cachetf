@@ -18,9 +18,8 @@ const (
 
 // S3Config holds S3 storage configuration
 type S3Config struct {
-	Bucket  string `env:"S3_BUCKET"`
-	Region  string `env:"S3_REGION" envDefault:"eu-central-1"`
-	RoleARN string `env:"S3_ROLE_ARN"`
+	Bucket string `env:"S3_BUCKET"`
+	Region string `env:"S3_REGION" envDefault:"eu-central-1"`
 }
 
 // Validate checks if the S3 configuration is valid
@@ -97,9 +96,8 @@ func LoadConfig() (*Config, error) {
 		CacheDir:    getEnv("CACHE_DIR", "./cache"),
 		LogLevel:    getEnv("LOG_LEVEL", "info"),
 		S3: S3Config{
-			Bucket:  getEnv("S3_BUCKET", ""),
-			Region:  getEnv("S3_REGION", "eu-central-1"),
-			RoleARN: getEnv("S3_ROLE_ARN", ""),
+			Bucket: getEnv("S3_BUCKET", ""),
+			Region: getEnv("S3_REGION", "eu-central-1"),
 		},
 	}
 

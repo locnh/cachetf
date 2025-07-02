@@ -40,9 +40,8 @@ func main() {
 	var store storage.Storage
 	if cfg.StorageType == "s3" {
 		s3Config := &storage.S3Config{
-			Bucket:  cfg.S3.Bucket,
-			Region:  cfg.S3.Region,
-			RoleARN: cfg.S3.RoleARN,
+			Bucket: cfg.S3.Bucket,
+			Region: cfg.S3.Region,
 		}
 		store, err = storage.NewS3Storage(s3Config, logrus.StandardLogger())
 		if err != nil {

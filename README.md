@@ -17,10 +17,24 @@ A high-performance proxy server for Terraform provider binaries with local cachi
 ### Prerequisites
 
 - Go 1.19 or higher
+- Docker
 - Git
 - Terraform (for testing)
 
-### Installation
+### Docker
+
+Run the Docker container:
+```bash
+docker run -d -p 8080:8080 --name cache-t-f locnh/cache-t-f
+```
+
+### Docker compose (recommended)
+
+```bash
+docker compose up -d
+```
+
+### Build from source
 
 1. Clone the repository:
    ```bash

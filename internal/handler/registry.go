@@ -341,20 +341,20 @@ func (h *RegistryHandler) GetProviderIndex(c *gin.Context) {
 		return
 	}
 
-	// Extract just the version strings
-	versions := make([]string, 0, len(versionsResp.Versions))
+	// Create a map with versions as keys and empty objects as values
+	versionsMap := make(map[string]struct{})
 	for _, v := range versionsResp.Versions {
-		versions = append(versions, v.Version)
+		versionsMap[v.Version] = struct{}{}
 	}
 
 	h.logger.WithFields(logrus.Fields{
 		"provider": provider,
-		"versions": len(versions),
+		"versions": len(versionsMap),
 	}).Info("Returning provider versions")
 
-	// Return the versions in the expected format
+	// Return the versions in the expected format with empty objects as values
 	c.JSON(http.StatusOK, gin.H{
-		"versions": versions,
+		"versions": versionsMap,
 	})
 }
 

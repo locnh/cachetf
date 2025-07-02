@@ -81,6 +81,14 @@ docker compose up -d
    ```
 
 5. Configure Terraform to use the [network mirror](https://developer.hashicorp.com/terraform/internals/provider-network-mirror-protocol#protocol-base-url) cache
+    ```hcl
+    provider_installation {
+        network_mirror {
+            # keep trailing slash / and must be https
+            url = "https://your-cache-server/providers/"
+        }
+    }
+    ```
 
 ## Metrics
 
@@ -88,25 +96,6 @@ The application exposes metrics at `/metrics` endpoint. The metrics are exposed 
 ```bash
 # Metrics port, default: 9100
 METRICS_PORT=9100
-```
-
-## Project Structure
-
-```
-.
-├── cmd/
-│   └── server/          # Main application entry point
-├── internal/
-│   ├── config/         # Configuration loading and validation
-│   ├── handler/        # HTTP request handlers
-│   └── routes/         # Route definitions and middleware
-├── pkg/
-│   └── logger/         # Logging utilities
-├── .env.example       # Example environment variables
-├── .gitignore         # Git ignore file
-├── go.mod             # Go module definition
-├── go.sum             # Go module checksums
-└── README.md          # This file
 ```
 
 ## API Endpoints
@@ -120,15 +109,16 @@ METRICS_PORT=9100
 
 ### Environment Variables
 
-| Variable              | Default           | Description                                                                 |
-|----------------------|-------------------|-----------------------------------------------------------------------------|
-| PORT                | 8080             | Port to run the server on                                                  |
-| URI_PREFIX          | /providers       | Base path for API endpoints                                                |
-| STORAGE_TYPE        | local            | Storage type: 'local' or 's3'                                         |
-| CACHE_DIR           | ./cache          | Local directory for cached binaries (used when STORAGE_TYPE=local)    |
-| LOG_LEVEL           | info             | Log level (debug, info, warn, error)                                       |
-| S3_BUCKET           | -                | S3 bucket name (required for S3 storage)                                   |
-| S3_REGION           | eu-central-1     | AWS region for S3 storage                                                  |
+| Variable            | Default           | Description                                                                 |
+|---------------------|-------------------|-----------------------------------------------------------------------------|
+| PORT                | 8080              | Port to run the server on                                                   |
+| METRICS_PORT        | 9100              | Port to run the metrics server on                                           |
+| URI_PREFIX          | /providers        | Base path for API endpoints                                                 |
+| STORAGE_TYPE        | local             | Storage type: 'local' or 's3'                                               |
+| CACHE_DIR           | ./cache           | Local directory for cached binaries (used when STORAGE_TYPE=local)          |
+| LOG_LEVEL           | info              | Log level (debug, info, warn, error)                                        |
+| S3_BUCKET           | -                 | S3 bucket name (required for S3 storage)                                    |
+| S3_REGION           | eu-central-1      | AWS region for S3 storage                                                   |
 
 ### Logging
 

@@ -16,6 +16,7 @@ vendor/
 
 # Cache directory
 cache/
+build/
 
 # Environment variables
 .env

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 
 	"cachetf/internal/config"
@@ -52,20 +53,39 @@ func main() {
 		store = storage.NewLocalStorage(cfg.CacheDir, logrus.StandardLogger())
 	}
 
+	// Wrap storage with metrics
+	store = storage.NewMetricsWrapper(store)
+
 	// Setup routes
 	routes.SetupRoutes(r, &routes.Config{
 		URIPrefix: cfg.URIPrefix,
 		Storage:   store,
 	})
 
-	// Initialize server
+	// Create metrics server
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", promhttp.Handler())
+
+	metricsSrv := &http.Server{
+		Addr:    fmt.Sprintf(":%d", cfg.MetricsPort),
+		Handler: metricsMux,
+	}
+
+	// Initialize main server
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.ServerPort),
 		Handler: r,
 	}
 
-	// Initializing the server in a goroutine so that
-	// it won't block the graceful shutdown handling
+	// Start metrics server in a goroutine
+	go func() {
+		logrus.Infof("Metrics server is running on %s", metricsSrv.Addr)
+		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logrus.Fatalf("Metrics server error: %v", err)
+		}
+	}()
+
+	// Start main server in a goroutine
 	go func() {
 		logrus.Infof("Server is running on %s", srv.Addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -80,13 +100,34 @@ func main() {
 	stop()
 	logrus.Info("Shutting down gracefully, press Ctrl+C again to force")
 
-	// The context is used to inform the server it has 5 seconds to finish
-	// the request it is currently handling
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Create a channel to receive shutdown signals
+	shutdownComplete := make(chan struct{}, 2)
 
-	if err := srv.Shutdown(ctx); err != nil {
-		logrus.Fatal("Server forced to shutdown: ", err)
+	// Shutdown main server
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := srv.Shutdown(ctx); err != nil {
+			logrus.Error("Server shutdown error: ", err)
+		}
+		shutdownComplete <- struct{}{}
+	}()
+
+	// Shutdown metrics server
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := metricsSrv.Shutdown(ctx); err != nil {
+			logrus.Error("Metrics server shutdown error: ", err)
+		}
+		shutdownComplete <- struct{}{}
+	}()
+
+	// Wait for both servers to shut down
+	for i := 0; i < 2; i++ {
+		<-shutdownComplete
 	}
 
 	logrus.Info("Server exiting")

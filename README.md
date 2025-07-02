@@ -25,7 +25,7 @@ A high-performance proxy server for Terraform/Tofu provider binaries with local 
 
 Run the Docker container:
 ```bash
-docker run -d -p 8080:8080 --name cachetf locnh/cachetf
+docker run -d -p 8080:8080 -p 9090:9090 --name cachetf locnh/cachetf
 ```
 
 ### Docker compose (recommended)
@@ -82,6 +82,14 @@ docker compose up -d
 
 5. Configure Terraform to use the [network mirror](https://developer.hashicorp.com/terraform/internals/provider-network-mirror-protocol#protocol-base-url) cache
 
+## Metrics
+
+The application exposes metrics at `/metrics` endpoint. The metrics are exposed in Prometheus format.
+```bash
+# Metrics port, default: 9100
+METRICS_PORT=9100
+```
+
 ## Project Structure
 
 ```
@@ -112,22 +120,15 @@ docker compose up -d
 
 ### Environment Variables
 
-### Environment Variables
-
 | Variable              | Default           | Description                                                                 |
 |----------------------|-------------------|-----------------------------------------------------------------------------|
 | PORT                | 8080             | Port to run the server on                                                  |
 | URI_PREFIX          | /providers       | Base path for API endpoints                                                |
-| STORAGE_TYPE        | filesystem       | Storage type: 'filesystem' or 's3'                                         |
-| CACHE_DIR           | ./cache          | Local directory for cached binaries (used when STORAGE_TYPE=filesystem)    |
+| STORAGE_TYPE        | local            | Storage type: 'local' or 's3'                                         |
+| CACHE_DIR           | ./cache          | Local directory for cached binaries (used when STORAGE_TYPE=local)    |
 | LOG_LEVEL           | info             | Log level (debug, info, warn, error)                                       |
-| AWS_ACCESS_KEY_ID   | -                | AWS access key (required for S3 storage)                                   |
-| AWS_SECRET_ACCESS_KEY | -              | AWS secret key (required for S3 storage)                                   |
-| AWS_REGION          | -                | AWS region for S3 bucket (required for S3 storage)                         |
 | S3_BUCKET           | -                | S3 bucket name (required for S3 storage)                                   |
-| S3_PREFIX           | ""               | Optional prefix for S3 objects (e.g., 'tf-cache/')                         |
-| S3_ENDPOINT         | AWS default      | Custom endpoint for S3-compatible storage                                  |
-| S3_FORCE_PATH_STYLE | false           | Set to 'true' for S3-compatible storage that uses path-style addressing    |
+| S3_REGION           | eu-central-1     | AWS region for S3 storage                                                  |
 
 ### Logging
 
@@ -152,10 +153,8 @@ To use S3 as the storage backend, set the following environment variables:
 2. Configure your AWS credentials and bucket:
    ```env
    STORAGE_TYPE=s3
-   AWS_ACCESS_KEY_ID=your-access-key
-   AWS_SECRET_ACCESS_KEY=your-secret-key
-   AWS_REGION=us-east-1
    S3_BUCKET=your-bucket-name
+   S3_REGION=eu-central-1
    ```
 
 ### S3 IAM Permissions
@@ -180,19 +179,6 @@ The following IAM permissions are required for the S3 bucket:
         }
     ]
 }
-```
-
-### Using with S3-compatible Storage
-
-For S3-compatible storage (like MinIO, Ceph, etc.), you can specify a custom endpoint:
-
-```env
-STORAGE_TYPE=s3
-S3_ENDPOINT=https://your-s3-endpoint.com
-S3_FORCE_PATH_STYLE=true
-AWS_ACCESS_KEY_ID=your-access-key
-AWS_SECRET_ACCESS_KEY=your-secret-key
-S3_BUCKET=your-bucket-name
 ```
 
 ## Contributing

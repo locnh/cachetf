@@ -6,11 +6,13 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
+      - "9100:9100"
     volumes:
       - ./cache:/cache
     environment:
       - GIN_MODE=release
       - PORT=8080
+      - METRICS_PORT=9100
       - CACHE_DIR=/cache
       - LOG_LEVEL=info
     healthcheck:

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
@@ -13,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/sirupsen/logrus"
+	"cachetf/internal/metrics"
 )
 
 // S3Storage implements Storage interface for S3
@@ -22,6 +24,7 @@ type S3Storage struct {
 	logger     *logrus.Logger
 	uploader   *manager.Uploader
 	downloader *manager.Downloader
+	metrics    *metrics.CacheMetrics
 }
 
 // S3Config holds the configuration for S3 storage
@@ -63,11 +66,25 @@ func NewS3Storage(cfg *S3Config, logger *logrus.Logger) (*S3Storage, error) {
 		logger:     logger,
 		uploader:   uploader,
 		downloader: downloader,
+		metrics:    metrics.NewCacheMetrics(),
 	}, nil
 }
 
 // Get downloads a file from S3
 func (s *S3Storage) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	// Check if file exists first
+	exists, err := s.Exists(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+
+	if !exists {
+		s.metrics.RecordMiss()
+		s.logger.WithField("key", key).Debug("Cache miss: file not found in S3")
+		return nil, os.ErrNotExist
+	}
+
+	// File exists, get it
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
@@ -75,26 +92,61 @@ func (s *S3Storage) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 
 	result, err := s.client.GetObject(ctx, input)
 	if err != nil {
-		var nsk *types.NoSuchKey
-		if errors.As(err, &nsk) {
-			return nil, errors.New("object does not exist")
-		}
+		s.logger.WithError(err).WithField("key", key).Error("Failed to get object from S3")
 		return nil, fmt.Errorf("failed to get object %s: %v", key, err)
 	}
 
+	// Record the hit and update metrics
+	s.metrics.RecordHit()
+	if result.ContentLength != nil {
+		s.metrics.UpdateSize(*result.ContentLength)
+	}
+
+	s.logger.WithField("key", key).Debug("Cache hit: file found in S3")
 	return result.Body, nil
 }
 
 // Put uploads a file to S3
 func (s *S3Storage) Put(ctx context.Context, key string, data io.Reader) error {
-	_, err := s.uploader.Upload(ctx, &s3.PutObjectInput{
+	// Check if file already exists to update size metrics
+	exists, err := s.Exists(ctx, key)
+	if err != nil {
+		s.logger.WithError(err).WithField("key", key).Error("Failed to check if object exists")
+		return fmt.Errorf("failed to check if object exists: %w", err)
+	}
+
+	if exists {
+		// Get the current size to update metrics
+		head, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(key),
+		})
+		if err == nil && head.ContentLength != nil {
+			s.metrics.UpdateSize(-*head.ContentLength)
+		}
+	}
+
+	// Upload the file
+	result, err := s.uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
 		Body:   data,
 	})
 
 	if err != nil {
+		s.metrics.RecordError("put")
 		return fmt.Errorf("failed to upload object %s: %v", key, err)
+	}
+
+	// Update metrics with new size if available
+	if result != nil && result.UploadID != "" {
+		head, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(key),
+		})
+		if err == nil && head.ContentLength != nil {
+			s.metrics.UpdateSize(*head.ContentLength)
+		}
 	}
 
 	s.logger.WithField("path", key).Info("Successfully uploaded object to S3")
@@ -113,6 +165,7 @@ func (s *S3Storage) Exists(ctx context.Context, key string) (bool, error) {
 		if errors.As(err, &notFound) {
 			return false, nil
 		}
+		s.metrics.RecordError("exists")
 		return false, fmt.Errorf("failed to check if object exists: %w", err)
 	}
 
@@ -125,9 +178,11 @@ func (s *S3Storage) DeleteByPrefix(ctx context.Context, prefix string) (int, err
 	
 	// List all objects with the given prefix
 	var objectIds []types.ObjectIdentifier
+	var totalSize int64
 	var continuationToken *string
 	var deletedCount int
 
+	// First, list all objects to get their sizes
 	for {
 		// List objects with pagination
 		listInput := &s3.ListObjectsV2Input{
@@ -138,12 +193,16 @@ func (s *S3Storage) DeleteByPrefix(ctx context.Context, prefix string) (int, err
 
 		listOutput, err := s.client.ListObjectsV2(ctx, listInput)
 		if err != nil {
+			s.metrics.RecordError("delete_by_prefix")
 			return deletedCount, fmt.Errorf("failed to list objects: %w", err)
 		}
 
-		// Add objects to delete batch
+		// Add objects to delete batch and accumulate their sizes
 		for _, obj := range listOutput.Contents {
 			objectIds = append(objectIds, types.ObjectIdentifier{Key: obj.Key})
+			if obj.Size != nil && *obj.Size > 0 {
+				totalSize += *obj.Size
+			}
 		}
 
 		// If there are no more objects, break the loop
@@ -176,15 +235,23 @@ func (s *S3Storage) DeleteByPrefix(ctx context.Context, prefix string) (int, err
 		})
 
 		if err != nil {
+			s.metrics.RecordError("delete_by_prefix")
 			return deletedCount, fmt.Errorf("failed to delete objects: %w", err)
 		}
 
 		deletedCount += len(batch)
 	}
 
+	// Update metrics
+	if totalSize > 0 {
+		s.metrics.UpdateSize(-totalSize)
+	}
+	s.metrics.RecordDeletion(deletedCount)
+
 	s.logger.WithFields(logrus.Fields{
 		"prefix": prefix,
 		"count":  deletedCount,
+		"size":   totalSize,
 	}).Info("Finished deleting objects by prefix")
 
 	return deletedCount, nil

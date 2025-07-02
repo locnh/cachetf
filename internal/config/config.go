@@ -36,6 +36,7 @@ func (c *S3Config) Validate() error {
 // Config holds the application configuration
 type Config struct {
 	ServerPort  int         `env:"PORT" envDefault:"8080"`
+	MetricsPort int         `env:"METRICS_PORT" envDefault:"9100"`
 	URIPrefix   string      `env:"URI_PREFIX" envDefault:"/providers"`
 	StorageType StorageType `env:"STORAGE_TYPE" envDefault:"local"`
 	CacheDir    string      `env:"CACHE_DIR" envDefault:"./cache"`
@@ -83,6 +84,11 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("invalid PORT value: %w", err)
 	}
 
+	metricsPort, err := strconv.Atoi(getEnv("METRICS_PORT", "9100"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid METRICS_PORT value: %w", err)
+	}
+
 	storageType := StorageType(getEnv("STORAGE_TYPE", "local"))
 	if storageType != StorageTypeLocal && storageType != StorageTypeS3 {
 		return nil, fmt.Errorf("invalid STORAGE_TYPE: must be 'local' or 's3'")
@@ -91,6 +97,7 @@ func LoadConfig() (*Config, error) {
 	// Create config instance
 	cfg := &Config{
 		ServerPort:  port,
+		MetricsPort: metricsPort,
 		URIPrefix:   getEnv("URI_PREFIX", "/providers"),
 		StorageType: storageType,
 		CacheDir:    getEnv("CACHE_DIR", "./cache"),

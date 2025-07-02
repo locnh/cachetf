@@ -10,13 +10,16 @@ import (
 	"sync"
 
 	"github.com/sirupsen/logrus"
+	"cachetf/internal/metrics"
 )
 
+// LocalStorage implements Storage interface using local filesystem
 type LocalStorage struct {
 	baseDir string
 	logger  *logrus.Logger
 	// mutexes provides per-key locking to prevent concurrent writes to the same file
 	mutexes sync.Map
+	metrics *metrics.CacheMetrics
 }
 
 // getMutex returns a mutex for the given key, creating it if it doesn't exist
@@ -26,35 +29,51 @@ func (s *LocalStorage) getMutex(key string) *sync.Mutex {
 	return mutex.(*sync.Mutex)
 }
 
+// NewLocalStorage creates a new LocalStorage instance
 func NewLocalStorage(baseDir string, logger *logrus.Logger) *LocalStorage {
 	return &LocalStorage{
 		baseDir: baseDir,
 		logger:  logger,
+		metrics: metrics.NewCacheMetrics(),
 	}
 }
 
 func (s *LocalStorage) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	path := filepath.Join(s.baseDir, key)
+
+	// Check if file exists first
+	exists, err := s.Exists(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+
+	if !exists {
+		s.metrics.RecordMiss()
+		s.logger.WithFields(logrus.Fields{
+			"key":  key,
+			"path": path,
+		}).Debug("Cache miss: file not found")
+		return nil, os.ErrNotExist
+	}
+
+	// Open the file
 	file, err := os.Open(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			s.logger.WithFields(logrus.Fields{
-				"key":  key,
-				"path": path,
-			}).Debug("Cache miss: file not found")
-		} else {
-			s.logger.WithError(err).WithFields(logrus.Fields{
-				"key":  key,
-				"path": path,
-			}).Error("Cache access error")
-		}
-		return nil, err
+		// Don't record another miss here, as the Exists check already recorded it
+		s.logger.WithError(err).WithField("path", path).Error("Failed to open file")
+		return nil, fmt.Errorf("failed to open file: %w", err)
 	}
 
 	s.logger.WithFields(logrus.Fields{
 		"key":  key,
 		"path": path,
 	}).Debug("Cache hit: file found")
+
+	// Record the hit and update file size in metrics
+	s.metrics.RecordHit()
+	if info, err := os.Stat(path); err == nil {
+		s.metrics.UpdateSize(int64(info.Size()))
+	}
 
 	return file, nil
 }
@@ -74,60 +93,60 @@ func (s *LocalStorage) Put(ctx context.Context, key string, r io.Reader) error {
 		return nil
 	}
 
-	// Create directory if it doesn't exist
+	// Check if file exists to update metrics
+	if info, err := os.Stat(path); err == nil {
+		// File exists, subtract its size from metrics
+		s.metrics.UpdateSize(-info.Size())
+	}
+
+	// Create all directories in the path if they don't exist
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		s.logger.WithError(err).WithField("path", filepath.Dir(path)).Error("Failed to create directory")
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	// Create the file with exclusive creation flag to prevent race conditions
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	// Create or truncate the file
+	f, err := os.Create(path)
 	if err != nil {
-		if os.IsExist(err) {
-			// File was created by another goroutine after our initial check
-			s.logger.WithField("path", path).Debug("File was created by another goroutine")
-			return nil
-		}
-		s.logger.WithError(err).WithField("path", path).Error("Failed to create file")
-		return fmt.Errorf("failed to create file: %w", err)
+		return fmt.Errorf("failed to create file %s: %w", path, err)
 	}
 
 	// Copy the content
 	defer f.Close()
-	if _, err = io.Copy(f, r); err != nil {
+	n, err := io.Copy(f, r)
+	if err != nil {
 		s.logger.WithError(err).WithField("path", path).Error("Failed to write file content")
 		// Try to clean up the file if writing failed
 		_ = os.Remove(path)
 		return fmt.Errorf("failed to write file content: %w", err)
 	}
 
+	// Update file size in metrics
+	s.metrics.UpdateSize(n)
+
 	// Ensure the file is synced to disk
 	if err := f.Sync(); err != nil {
 		s.logger.WithError(err).WithField("path", path).Error("Failed to sync file to disk")
-		return fmt.Errorf("failed to sync file: %w", err)
 	}
 
-	s.logger.WithField("path", path).Debug("Successfully wrote file")
+	s.logger.WithFields(logrus.Fields{
+		"path": path,
+		"size": n,
+	}).Debug("Successfully stored file in cache")
+
 	return nil
 }
 
 func (s *LocalStorage) Exists(ctx context.Context, key string) (bool, error) {
 	path := filepath.Join(s.baseDir, key)
-	_, err := os.Stat(path)
 
+	_, err := os.Stat(path)
 	if err == nil {
-		s.logger.WithFields(logrus.Fields{
-			"key":  key,
-			"path": path,
-		}).Debug("Cache hit: file exists")
+		s.logger.WithField("path", path).Debug("Cache hit: file exists")
 		return true, nil
 	}
 
 	if os.IsNotExist(err) {
-		s.logger.WithFields(logrus.Fields{
-			"key":  key,
-			"path": path,
-		}).Debug("Cache miss: file does not exist")
+		s.logger.WithField("path", path).Debug("Cache miss: file does not exist")
 		return false, nil
 	}
 
@@ -161,12 +180,15 @@ func (s *LocalStorage) DeleteByPrefix(ctx context.Context, prefix string) (int, 
 		if err := os.Remove(searchPath); err != nil {
 			return 0, fmt.Errorf("error deleting file %s: %w", searchPath, err)
 		}
+		s.metrics.UpdateSize(-fileInfo.Size())
 		s.logger.WithField("path", searchPath).Debug("Deleted file")
 		return 1, nil
 	}
 
 	// For directories, walk and count all files
 	var deletedCount int
+	var totalSize int64
+
 	err = filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -180,6 +202,7 @@ func (s *LocalStorage) DeleteByPrefix(ctx context.Context, prefix string) (int, 
 		// Only count files, not directories
 		if !info.IsDir() {
 			deletedCount++
+			totalSize += info.Size()
 			s.logger.WithField("path", path).Debug("Marked file for deletion")
 		}
 
@@ -195,9 +218,14 @@ func (s *LocalStorage) DeleteByPrefix(ctx context.Context, prefix string) (int, 
 		return 0, fmt.Errorf("error deleting directory %s: %w", searchPath, err)
 	}
 
+	// Update metrics with total size and count of deleted files
+	s.metrics.UpdateSize(-totalSize)
+	s.metrics.RecordDeletion(deletedCount)
+
 	s.logger.WithFields(logrus.Fields{
 		"path":  searchPath,
 		"count": deletedCount,
+		"size":  totalSize,
 	}).Info("Deleted directory and its contents")
 
 	s.logger.WithFields(logrus.Fields{

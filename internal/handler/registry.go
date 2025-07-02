@@ -574,117 +574,113 @@ func (h *RegistryHandler) DownloadProvider(c *gin.Context) {
 	// Construct the filename
 	filename := fmt.Sprintf("terraform-provider-%s_%s_%s_%s.zip", provider, version, osName, arch)
 
-	// Check if the file exists in the cache
+	// Get the cache key
 	cacheKey := h.getCacheKey(registry, namespace, provider, version, osName, arch)
 
-	// Check if the file exists in the cache
-	exists, err := h.storage.Exists(c.Request.Context(), cacheKey)
-	if err != nil {
-		h.logger.WithError(err).WithField("key", cacheKey).Error("Failed to check if file exists in cache")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check cache"})
-		return
-	}
-
-	if exists {
-		h.logger.WithField("key", cacheKey).Info("Serving from cache")
+	// Try to get the file directly - this will handle cache hit/miss metrics
+	h.logger.WithField("key", cacheKey).Debug("Attempting to get file from cache")
+	fileReader, err := h.storage.Get(c.Request.Context(), cacheKey)
+	if err == nil {
 		// File exists in cache, serve it
-		fileReader, err := h.storage.Get(c.Request.Context(), cacheKey)
-		if err != nil {
-			h.logger.WithError(err).Error("Failed to get file from cache")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get file from cache"})
-			return
-		}
 		defer fileReader.Close()
+		h.logger.WithField("key", cacheKey).Info("Serving from cache")
 
 		// Set the appropriate headers
 		c.Header("Content-Type", "application/zip")
 		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
 
-		// Stream the file to the client
+		// Stream the file
 		_, err = io.Copy(c.Writer, fileReader)
 		if err != nil && !isBrokenPipeError(err) {
-			h.logger.WithError(err).Error("Failed to stream file from cache")
+			h.logger.WithError(err).Error("Failed to send file")
 		}
+		return
+	} else if err != nil && err != os.ErrNotExist {
+		// Handle other errors
+		h.logger.WithError(err).WithField("key", cacheKey).Error("Failed to get file from cache")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get file from cache"})
 		return
 	}
 
-	// If file doesn't exist in storage, download it
-	if !exists {
-		h.logger.WithField("key", cacheKey).Info("File not found in storage, downloading...")
+	// File not in cache, download it
+	h.logger.WithField("key", cacheKey).Info("File not found in cache, downloading...")
 
-		// Get the download URL from the upstream registry
-		downloadURL := fmt.Sprintf("https://%s/v1/providers/%s/%s/%s/download/%s/%s",
-			registry,
-			namespace,
-			provider,
-			version,
-			osName,
-			arch,
-		)
+	// Get the download URL from the upstream registry
+	downloadURL := fmt.Sprintf("https://%s/v1/providers/%s/%s/%s/download/%s/%s",
+		registry,
+		namespace,
+		provider,
+		version,
+		osName,
+		arch,
+	)
 
-		h.logger.WithField("url", downloadURL).Debug("Fetching download info from upstream")
+	h.logger.WithField("url", downloadURL).Debug("Fetching download info from upstream")
 
-		req, err := http.NewRequest("GET", downloadURL, nil)
-		if err != nil {
-			h.logger.WithError(err).Error("Failed to create request")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
-			return
-		}
-
-		req.Header.Set("Accept", "application/json")
-
-		resp, err := h.httpClient.Do(req)
-		if err != nil {
-			h.logger.WithError(err).Error("Failed to fetch download info")
-			c.JSON(http.StatusBadGateway, gin.H{"error": "failed to fetch download info"})
-			return
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			h.logger.WithFields(logrus.Fields{
-				"status": resp.StatusCode,
-				"url":    downloadURL,
-			}).Error("Unexpected status code from registry")
-			c.JSON(resp.StatusCode, gin.H{"error": "failed to fetch download info"})
-			return
-		}
-
-		var downloadInfo DownloadResponse
-		if err := json.NewDecoder(resp.Body).Decode(&downloadInfo); err != nil {
-			h.logger.WithError(err).Error("Failed to parse download info")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to parse download info"})
-			return
-		}
-
-		// Validate download info
-		if downloadInfo.DownloadURL == "" || downloadInfo.SHASum == "" {
-			h.logger.Error("Missing download URL or SHA256 checksum in response")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid download information"})
-			return
-		}
-
-		h.logger.WithFields(logrus.Fields{
-			"download_url": downloadInfo.DownloadURL,
-			"sha256":       downloadInfo.SHASum,
-		}).Info("Downloading provider binary")
-
-		// Download and store the file
-		_, err = h.downloadFile(downloadInfo.DownloadURL, cacheKey, downloadInfo.SHASum)
-		if err != nil {
-			h.logger.WithError(err).Error("Failed to download or verify provider binary")
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error":   "failed to download or verify provider binary",
-				"details": err.Error(),
-			})
-			return
-		}
-
-		h.logger.WithFields(logrus.Fields{
-			"key":    cacheKey,
-			"sha256": downloadInfo.SHASum,
-		}).Info("Successfully downloaded and verified provider binary")
+	req, err := http.NewRequest("GET", downloadURL, nil)
+	if err != nil {
+		h.logger.WithError(err).Error("Failed to create request")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+		return
 	}
+
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		h.logger.WithError(err).Error("Failed to fetch download info")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to fetch download info"})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		h.logger.WithFields(logrus.Fields{
+			"status": resp.Status,
+			"body":   string(body),
+		}).Error("Unexpected response from registry")
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":  "failed to fetch download info",
+			"status": resp.Status,
+		})
+		return
+	}
+
+	var downloadInfo DownloadResponse
+	if err := json.NewDecoder(resp.Body).Decode(&downloadInfo); err != nil {
+		h.logger.WithError(err).Error("Failed to parse download info response")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to parse download info"})
+		return
+	}
+
+	// Validate download info
+	if downloadInfo.DownloadURL == "" || downloadInfo.SHASum == "" {
+		h.logger.Error("Missing download URL or SHA256 checksum in response")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid download information"})
+		return
+	}
+
+	h.logger.WithFields(logrus.Fields{
+		"download_url": downloadInfo.DownloadURL,
+		"sha256":       downloadInfo.SHASum,
+	}).Info("Downloading provider binary")
+
+	// Download and store the file
+	_, err = h.downloadFile(downloadInfo.DownloadURL, cacheKey, downloadInfo.SHASum)
+	if err != nil {
+		h.logger.WithError(err).Error("Failed to download or verify provider binary")
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "failed to download or verify provider binary",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	h.logger.WithFields(logrus.Fields{
+		"key":    cacheKey,
+		"sha256": downloadInfo.SHASum,
+	}).Info("Successfully downloaded and verified provider binary")
 
 	// Get the file from storage
 	reader, err := h.storage.Get(c.Request.Context(), cacheKey)

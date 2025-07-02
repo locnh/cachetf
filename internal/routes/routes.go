@@ -20,8 +20,10 @@ func SetupRoutes(router *gin.Engine, config *Config) {
 		logrus.Fatal("Storage is not configured")
 	}
 
-	// Create handler with logger and storage
-	registryHandler := handler.NewRegistryHandler(logrus.StandardLogger(), config.Storage)
+	// Create handlers with logger and storage
+	logger := logrus.StandardLogger()
+	registryHandler := handler.NewRegistryHandler(logger, config.Storage)
+	cacheHandler := handler.NewCacheHandler(config.Storage, logger)
 
 	// Health check endpoint
 	router.GET("/health", func(c *gin.Context) {
@@ -32,6 +34,16 @@ func SetupRoutes(router *gin.Engine, config *Config) {
 
 	// Base group with configurable URI prefix
 	base := router.Group(config.URIPrefix)
+
+	// Cache management endpoints
+	{
+		// DELETE /:registry/...
+		base.DELETE("/:registry", cacheHandler.DeleteCache)
+		base.DELETE("/:registry/:namespace", cacheHandler.DeleteCache)
+		base.DELETE("/:registry/:namespace/:provider", cacheHandler.DeleteCache)
+		base.DELETE("/:registry/:namespace/:provider/:version", cacheHandler.DeleteCache)
+		base.DELETE("/:registry/:namespace/:provider/:version/:file", cacheHandler.DeleteCache)
+	}
 
 	// Terraform Registry API endpoints
 	registry := base.Group("/:registry/:namespace/:provider")

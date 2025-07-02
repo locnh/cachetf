@@ -117,13 +117,85 @@ func (s *S3Storage) Exists(ctx context.Context, key string) (bool, error) {
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
 	})
+
 	if err != nil {
-		var notFoundErr *types.NoSuchKey
-		if errors.As(err, &notFoundErr) {
+		var notFound *types.NotFound
+		if errors.As(err, &notFound) {
 			return false, nil
 		}
-		return false, fmt.Errorf("failed to check if object %s exists: %w", key, err)
+		return false, fmt.Errorf("failed to check if object exists: %w", err)
 	}
+
 	return true, nil
 }
 
+// DeleteByPrefix deletes all objects with the given prefix
+func (s *S3Storage) DeleteByPrefix(ctx context.Context, prefix string) (int, error) {
+	s.logger.WithField("prefix", prefix).Info("Deleting objects by prefix")
+	
+	// List all objects with the given prefix
+	var objectIds []types.ObjectIdentifier
+	var continuationToken *string
+	var deletedCount int
+
+	for {
+		// List objects with pagination
+		listInput := &s3.ListObjectsV2Input{
+			Bucket:            aws.String(s.bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: continuationToken,
+		}
+
+		listOutput, err := s.client.ListObjectsV2(ctx, listInput)
+		if err != nil {
+			return deletedCount, fmt.Errorf("failed to list objects: %w", err)
+		}
+
+		// Add objects to delete batch
+		for _, obj := range listOutput.Contents {
+			objectIds = append(objectIds, types.ObjectIdentifier{Key: obj.Key})
+		}
+
+		// If there are no more objects, break the loop
+		if !aws.ToBool(listOutput.IsTruncated) {
+			break
+		}
+		continuationToken = listOutput.NextContinuationToken
+	}
+
+	// If no objects found, return early
+	if len(objectIds) == 0 {
+		s.logger.WithField("prefix", prefix).Info("No objects found with prefix")
+		return 0, nil
+	}
+
+	// Delete objects in batches of 1000 (S3 API limit)
+	for i := 0; i < len(objectIds); i += 1000 {
+		end := i + 1000
+		if end > len(objectIds) {
+			end = len(objectIds)
+		}
+
+		batch := objectIds[i:end]
+		_, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(s.bucket),
+			Delete: &types.Delete{
+				Objects: batch,
+				Quiet:   aws.Bool(true),
+			},
+		})
+
+		if err != nil {
+			return deletedCount, fmt.Errorf("failed to delete objects: %w", err)
+		}
+
+		deletedCount += len(batch)
+	}
+
+	s.logger.WithFields(logrus.Fields{
+		"prefix": prefix,
+		"count":  deletedCount,
+	}).Info("Finished deleting objects by prefix")
+
+	return deletedCount, nil
+}

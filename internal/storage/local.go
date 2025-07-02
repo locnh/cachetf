@@ -138,3 +138,59 @@ func (s *LocalStorage) Exists(ctx context.Context, key string) (bool, error) {
 
 	return false, err
 }
+
+// DeleteByPrefix deletes all files with the given prefix
+func (s *LocalStorage) DeleteByPrefix(ctx context.Context, prefix string) (int, error) {
+	s.logger.WithField("prefix", prefix).Info("Deleting files by prefix")
+	
+	// Ensure the prefix is a directory
+	searchPath := filepath.Join(s.baseDir, prefix)
+	
+	// Check if the path exists first
+	_, err := os.Stat(searchPath)
+	if os.IsNotExist(err) {
+		return 0, nil // No files to delete
+	}
+	if err != nil {
+		return 0, fmt.Errorf("error checking path %s: %w", searchPath, err)
+	}
+
+	// Walk the directory and delete matching files
+	var deletedCount int
+	err = filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip the root directory
+		if path == searchPath {
+			return nil
+		}
+
+		// Delete the file or directory
+		if err := os.RemoveAll(path); err != nil {
+			s.logger.WithError(err).WithField("path", path).Error("Failed to delete path")
+			return err
+		}
+
+		// If it's a directory, we'll count each file in it
+		if info.IsDir() {
+			return filepath.SkipDir
+		}
+
+		deletedCount++
+		s.logger.WithField("path", path).Debug("Deleted file")
+		return nil
+	})
+
+	if err != nil {
+		return deletedCount, fmt.Errorf("error walking path %s: %w", searchPath, err)
+	}
+
+	s.logger.WithFields(logrus.Fields{
+		"prefix": prefix,
+		"count":  deletedCount,
+	}).Info("Finished deleting files by prefix")
+
+	return deletedCount, nil
+}

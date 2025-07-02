@@ -1,6 +1,6 @@
-# Terraform Registry Cache Proxy
+# TF Registry Cache Proxy
 
-A high-performance proxy server for Terraform provider binaries with local caching capabilities. Built with Go, Gin, and Logrus.
+A high-performance proxy server for Terraform/Tofu provider binaries with local or s3 backend caching capabilities. Built with Go, Gin, and Logrus.
 
 ## Features
 

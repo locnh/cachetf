@@ -11,6 +11,8 @@ A high-performance proxy server for Terraform/Tofu provider binaries with local 
 - Environment-based configuration
 - Graceful shutdown
 - Support for multiple provider versions and platforms
+- Support `metrics` endpoint for monitoring
+- Support `DELETE` endpoint for deleting cached binaries
 
 ## Getting Started
 

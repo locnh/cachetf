@@ -1,0 +1,34 @@
+---
+services:
+  cache-t-f:
+    image: locnh/cache-t-f:latest
+    container_name: cache-t-f
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./cache:/cache
+    environment:
+      - GIN_MODE=release
+      - PORT=8080
+      - CACHE_DIR=/cache
+      - LOG_LEVEL=info
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Uncomment if you want to run as a specific user
+    # user: "1000:1000"
+    # Uncomment to limit resources
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '1'
+    #       memory: 512M

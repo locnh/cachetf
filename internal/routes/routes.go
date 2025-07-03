@@ -42,7 +42,6 @@ func SetupRoutes(router *gin.Engine, config *Config) {
 		base.DELETE("/:registry/:namespace", cacheHandler.DeleteCache)
 		base.DELETE("/:registry/:namespace/:provider", cacheHandler.DeleteCache)
 		base.DELETE("/:registry/:namespace/:provider/:version", cacheHandler.DeleteCache)
-		base.DELETE("/:registry/:namespace/:provider/:version/:file", cacheHandler.DeleteCache)
 	}
 
 	// Terraform Registry API endpoints

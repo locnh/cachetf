@@ -595,7 +595,7 @@ func (h *RegistryHandler) DownloadProvider(c *gin.Context) {
 			h.logger.WithError(err).Error("Failed to send file")
 		}
 		return
-	} else if err != nil && err != os.ErrNotExist {
+	} else if err != os.ErrNotExist {
 		// Handle other errors
 		h.logger.WithError(err).WithField("key", cacheKey).Error("Failed to get file from cache")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get file from cache"})

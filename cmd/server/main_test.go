@@ -1,4 +1,4 @@
-package main
+package main_test
 
 import (
 	"context"
@@ -98,12 +98,8 @@ func TestMetricsServer(t *testing.T) {
 	})
 
 	// Cleanup
-	cancel()
-
-	// Shutdown servers
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-
-	_ = srv.Shutdown(shutdownCtx)
-	_ = metricsSrv.Shutdown(shutdownCtx)
+	t.Cleanup(func() {
+		_ = srv.Shutdown(context.Background())
+		_ = metricsSrv.Shutdown(context.Background())
+	})
 }

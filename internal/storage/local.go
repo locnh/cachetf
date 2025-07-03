@@ -29,6 +29,28 @@ func (s *LocalStorage) getMutex(key string) *sync.Mutex {
 	return mutex.(*sync.Mutex)
 }
 
+// validatePath ensures the path is within the base directory and doesn't contain any path traversal
+func (s *LocalStorage) validatePath(key string) (string, error) {
+	// Clean the path to resolve any . or .. elements
+	cleanPath := filepath.Clean(key)
+	
+	// Check for path traversal attempts
+	if cleanPath == ".." || cleanPath == "." || len(cleanPath) >= 2 && cleanPath[0] == '.' && cleanPath[1] == '.' {
+		return "", fmt.Errorf("invalid path: %s", key)
+	}
+	
+	// Join with base directory and clean again
+	fullPath := filepath.Join(s.baseDir, cleanPath)
+	
+	// Verify the final path is still within the base directory
+	relPath, err := filepath.Rel(s.baseDir, fullPath)
+	if err != nil || relPath == ".." || len(relPath) >= 3 && relPath[0:3] == "../" {
+		return "", fmt.Errorf("invalid path: %s", key)
+	}
+	
+	return fullPath, nil
+}
+
 // NewLocalStorage creates a new LocalStorage instance
 func NewLocalStorage(baseDir string, logger *logrus.Logger) *LocalStorage {
 	return &LocalStorage{
@@ -39,7 +61,10 @@ func NewLocalStorage(baseDir string, logger *logrus.Logger) *LocalStorage {
 }
 
 func (s *LocalStorage) Get(ctx context.Context, key string) (io.ReadCloser, error) {
-	path := filepath.Join(s.baseDir, key)
+	path, err := s.validatePath(key)
+	if err != nil {
+		return nil, err
+	}
 
 	// Check if file exists first
 	exists, err := s.Exists(ctx, key)
@@ -84,7 +109,10 @@ func (s *LocalStorage) Put(ctx context.Context, key string, r io.Reader) error {
 	mutex.Lock()
 	defer mutex.Unlock()
 
-	path := filepath.Join(s.baseDir, key)
+	path, err := s.validatePath(key)
+	if err != nil {
+		return err
+	}
 
 	// Check if file already exists (quick check before creating directories)
 	if _, err := os.Stat(path); err == nil {
@@ -137,9 +165,12 @@ func (s *LocalStorage) Put(ctx context.Context, key string, r io.Reader) error {
 }
 
 func (s *LocalStorage) Exists(ctx context.Context, key string) (bool, error) {
-	path := filepath.Join(s.baseDir, key)
+	path, err := s.validatePath(key)
+	if err != nil {
+		return false, err
+	}
 
-	_, err := os.Stat(path)
+	_, err = os.Stat(path)
 	if err == nil {
 		s.logger.WithField("path", path).Debug("Cache hit: file exists")
 		return true, nil
@@ -162,8 +193,12 @@ func (s *LocalStorage) Exists(ctx context.Context, key string) (bool, error) {
 func (s *LocalStorage) DeleteByPrefix(ctx context.Context, prefix string) (int, error) {
 	s.logger.WithField("prefix", prefix).Info("Deleting files by prefix")
 	
-	// Ensure the prefix is a directory
-	searchPath := filepath.Join(s.baseDir, prefix)
+	// Validate the prefix path
+	searchPath, err := s.validatePath(prefix)
+	if err != nil {
+		s.logger.WithError(err).WithField("prefix", prefix).Error("Invalid prefix path")
+		return 0, fmt.Errorf("invalid prefix path: %s", prefix)
+	}
 	
 	// Check if the path exists first
 	fileInfo, err := os.Stat(searchPath)

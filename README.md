@@ -106,6 +106,10 @@ METRICS_PORT=9100
 - `GET /providers/:registry/:namespace/:provider/index.json` - List available versions
 - `GET /providers/:registry/:namespace/:provider/:version.json` - List available platforms
 - `GET /providers/:registry/:namespace/:provider/terraform-provider-${provider}_${version}_${platform}_${arch}.zip` - Download provider binary
+- `DELETE /providers/:registry/:namespace/:provider/:version` - Delete provider binary
+- `DELETE /providers/:registry/:namespace/:provider` - Delete provider
+- `DELETE /providers/:registry/:namespace` - Delete namespace
+- `DELETE /providers/:registry` - Delete registry
 
 ## Configuration
 

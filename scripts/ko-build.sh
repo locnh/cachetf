@@ -13,8 +13,8 @@ LOAD=true
 # Help function
 show_help() {
     cat << 'EOF'
-Usage: ./docker-build.sh [OPTIONS]
-Build and optionally push Docker images for multiple platforms.
+Usage: ./ko-build.sh [OPTIONS]
+Build and optionally push container images using ko.
 
 Options:
   --registry=REGISTRY    Docker registry URL (e.g., ghcr.io/username)
@@ -27,19 +27,19 @@ Options:
 
 Examples:
   # Build for local development (single platform)
-  ./docker-build.sh
+  ./ko-build.sh
 
   # Build and push multi-arch image
-  ./docker-build.sh --push
+  ./ko-build.sh --push
 
   # Build with custom registry and tag
-  ./docker-build.sh --registry=ghcr.io/username --tag=v1.0.0 --push
+  ./ko-build.sh --registry=docker.io --tag=v1.0.0 --push
 
   # Build for specific platforms
-  ./docker-build.sh --platforms=linux/arm64
+  ./ko-build.sh --platforms=linux/arm64
 
   # Build without loading to local Docker
-  ./docker-build.sh --no-load
+  ./ko-build.sh --no-load
 EOF
     exit 0
 }
@@ -90,75 +90,69 @@ done
 
 # Set the full image name
 if [ -n "$DOCKER_REGISTRY" ]; then
-    FULL_IMAGE_NAME="${DOCKER_REGISTRY}/${IMAGE_NAME}:${TAG}"
+    FULL_IMAGE_NAME="${DOCKER_REGISTRY}/${IMAGE_NAME}"
 else
-    FULL_IMAGE_NAME="${IMAGE_NAME}:${TAG}"
+    FULL_IMAGE_NAME="${IMAGE_NAME}"
 fi
 
-echo "Building Docker image ${FULL_IMAGE_NAME} for platforms: ${PLATFORMS}"
+echo "Building container image ${FULL_IMAGE_NAME}:${TAG} for platforms: ${PLATFORMS}"
 
-# Ensure buildx is available
-docker buildx version >/dev/null 2>&1 || {
-    echo "Docker Buildx is required but not installed or not in PATH"
+# Ensure ko is available
+if ! command -v ko &> /dev/null; then
+    echo "ko is required but not installed. Please install it first."
+    echo "See: https://github.com/ko-build/ko#install"
     exit 1
-}
-
-# Create a new builder instance if needed
-BUILDER_NAME="cachetf-builder"
-if ! docker buildx inspect "$BUILDER_NAME" >/dev/null 2>&1; then
-    echo "Creating new builder: $BUILDER_NAME"
-    docker buildx create --name "$BUILDER_NAME" --use
 fi
 
-# Determine build command based on whether we're pushing or loading
+# Prepare ko environment
+export KO_DOCKER_REPO="$FULL_IMAGE_NAME"
+
+# Build command arguments
+KO_ARGS=(
+    "--bare"
+    "--platform=$PLATFORMS"
+    "--image-label=org.opencontainers.image.version=$TAG"
+    "--image-label=org.opencontainers.image.revision=$(git rev-parse HEAD)"
+    "--image-label=org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    "--tags=$TAG"  # Explicitly set the tag
+)
+
+# Add push flag if needed
 if [ "$PUSH" = true ]; then
-    # For pushing, we can build all platforms
-    BUILD_CMD=(
-        docker buildx build
-        --platform "$PLATFORMS"
-        -t "$FULL_IMAGE_NAME"
-        --push
-        --build-arg VERSION="$TAG"
-        --build-arg GIT_COMMIT="$(git rev-parse HEAD)"
-        --build-arg BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-        .
-    )
+    KO_ARGS+=("--push")
 else
-    # For local loading, we can only handle one platform at a time
+    KO_ARGS+=("--local")
+    
+    # For local builds, we can only handle one platform at a time
     if [[ "$PLATFORMS" == *,* ]]; then
         echo "Warning: Cannot load multiple platforms into local Docker daemon. Building for first platform only."
         PLATFORM_TO_BUILD=$(echo "$PLATFORMS" | cut -d',' -f1)
-    else
-        PLATFORM_TO_BUILD="$PLATFORMS"
+        KO_ARGS[1]="--platform=$PLATFORM_TO_BUILD"
     fi
-
-    BUILD_CMD=(
-        docker buildx build
-        --platform "$PLATFORM_TO_BUILD"
-        -t "$FULL_IMAGE_NAME"
-        --load
-        --build-arg VERSION="$TAG"
-        --build-arg GIT_COMMIT="$(git rev-parse HEAD)"
-        --build-arg BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-        .
-    )
+    
+    # Only set load if explicitly requested
+    if [ "$LOAD" = true ]; then
+        KO_ARGS+=("--image-refs=./ko-image-refs")
+    fi
 fi
 
+# Add the path to build (current directory by default)
+KO_ARGS+=("./cmd/server")
+
 # Execute the build command
-echo "Running: ${BUILD_CMD[*]}"
-"${BUILD_CMD[@]}"
+echo "Running: ko build ${KO_ARGS[*]}"
+ko build "${KO_ARGS[@]}"
 
 # Output the image information
 echo "Image built successfully"
-echo "Image: ${FULL_IMAGE_NAME}"
+echo "Image: ${FULL_IMAGE_NAME}:${TAG}"
 echo "Platforms: ${PLATFORMS}"
 
-if [ "$PUSH" = false ]; then
-    if [[ "$PLATFORMS" == *,* ]]; then
-        echo "To push multi-arch image, run:"
-        echo "  ./scripts/docker-build.sh --push"
-    else
-        echo "To push the image, run:"
-        echo "  docker push ${FULL_IMAGE_NAME}"
-    fi
+if [ "$PUSH" = false ] && [ "$LOAD" = true ]; then
+    echo "To push the image, run:"
+    echo "  docker push ${FULL_IMAGE_NAME}:${TAG}"
+elif [ "$PUSH" = false ] && [ "$LOAD" = false ]; then
+    echo "Image references saved to ./ko-image-refs"
+    echo "To load the image, run:"
+    echo "  docker load -i ./ko-image-refs"
 fi

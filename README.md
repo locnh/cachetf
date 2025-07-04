@@ -25,16 +25,27 @@ A high-performance proxy server for Terraform/Tofu provider binaries with local 
 
 ### Docker
 
-Run the Docker container:
-```bash
-docker run -d -p 8080:8080 -p 9090:9090 --name cachetf locnh/cachetf
-```
-
-### Docker compose (recommended)
+Run the Docker container with a specific version tag (replace `v0.2.0` with the desired version):
 
 ```bash
-docker compose up -d
+docker run -d -p 8080:8080 -p 9090:9090 --name cachetf locnh/cachetf:v0.2.0
 ```
+
+> **Important**: Always use versioned tags (e.g., `v0.2.0`) instead of `latest` to ensure version compatibility and reproducibility in production environments.
+
+### Docker Compose (Recommended)
+
+1. Edit `docker-compose.yaml` and specify the version tag:
+   ```yaml
+   services:
+     cachetf:
+       image: locnh/cachetf:v0.2.0  # Specify the version tag here
+   ```
+
+2. Start the service:
+   ```bash
+   docker compose up -d
+   ```
 
 ### Build from source
 

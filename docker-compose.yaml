@@ -1,7 +1,7 @@
 ---
 services:
   cachetf:
-    image: locnh/cachetf:latest
+    image: locnh/cachetf:v0.2.0
     container_name: cachetf
     restart: unless-stopped
     ports:

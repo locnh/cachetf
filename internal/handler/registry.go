@@ -501,8 +501,10 @@ func (h *RegistryHandler) GetProviderVersion(c *gin.Context) {
 		}
 
 		h.logger.WithFields(logrus.Fields{
-			"version":  version,
-			"archives": len(response.Archives),
+			"registry":  registry,
+			"namespace": namespace,
+			"provider":  provider,
+			"version":   version,
 		}).Info("Returning version details")
 
 		c.JSON(http.StatusOK, response)

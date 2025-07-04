@@ -16,13 +16,6 @@ import (
 	"github.com/stretchr/testify/mock"
 )
 
-// mockReadCloser is a mock implementation of io.ReadCloser
-type mockReadCloser struct {
-	io.Reader
-}
-
-func (m *mockReadCloser) Close() error { return nil }
-
 // MockStorage is a mock implementation of the storage interface
 type MockStorage struct {
 	mock.Mock
